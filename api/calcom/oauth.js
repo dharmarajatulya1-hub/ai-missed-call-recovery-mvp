@@ -1,23 +1,22 @@
 /**
- * Cal.com OAuth2 Callback Handler
+ * Cal.com OAuth2 Handler
  * 
- * This endpoint handles the OAuth2 callback from Cal.com after
- * a business authorizes the integration.
+ * This endpoint handles BOTH:
+ * 1. Initial redirect TO Cal.com (with business_id)
+ * 2. Callback FROM Cal.com (with code and state)
  * 
  * Flow:
- * 1. Business clicks "Connect Cal.com" in dashboard
+ * 1. Business visits: /api/calcom/oauth?business_id=xxx
  * 2. Redirected to Cal.com authorization page
- * 3. Cal.com redirects back here with code
+ * 3. Cal.com redirects back with code
  * 4. Exchange code for access token
  * 5. Store credentials in database
- * 6. Redirect to success page
  * 
  * URL: /api/calcom/oauth
  * Method: GET
- * Query params: code, state
  */
 
-const { exchangeCodeForToken, getEventTypes } = require('../../lib/calcom');
+const { exchangeCodeForToken } = require('../../lib/calcom');
 const { updateCalcomCredentials } = require('../../lib/supabase');
 
 module.exports = async (req, res) => {
@@ -26,19 +25,62 @@ module.exports = async (req, res) => {
   }
 
   try {
-    const { code, state, error, error_description } = req.query;
+    const { code, state, business_id, error: oauthError, error_description } = req.query;
 
-    // Handle OAuth errors
-    if (error) {
-      console.error('❌ Cal.com OAuth error:', error, error_description);
-      return res.redirect(`/dashboard?error=calcom_auth_failed&message=${encodeURIComponent(error_description || error)}`);
+    // Handle OAuth errors from Cal.com
+    if (oauthError) {
+      console.error('❌ Cal.com OAuth error:', oauthError, error_description);
+      return res.status(400).json({
+        error: 'OAuth failed',
+        message: error_description || oauthError
+      });
     }
 
-    // Validate required parameters
+    // ============================================
+    // STEP 1: Initial Request - Redirect TO Cal.com
+    // ============================================
+    if (!code && business_id) {
+      console.log('🔐 Starting Cal.com OAuth for business:', business_id);
+
+      // Validate environment variables
+      const clientId = process.env.CALCOM_CLIENT_ID;
+      const redirectUri = process.env.CALCOM_REDIRECT_URI;
+
+      if (!clientId || !redirectUri) {
+        console.error('❌ Missing Cal.com OAuth configuration');
+        return res.status(500).json({
+          error: 'Configuration error',
+          message: 'Cal.com OAuth not configured. Check CALCOM_CLIENT_ID and CALCOM_REDIRECT_URI.'
+        });
+      }
+
+      // Create state parameter (base64 encoded business_id)
+      const stateData = JSON.stringify({ businessId: business_id });
+      const encodedState = Buffer.from(stateData).toString('base64');
+
+      // Build Cal.com authorization URL
+      const authUrl = new URL('https://app.cal.com/auth/oauth2/authorize');
+      authUrl.searchParams.append('client_id', clientId);
+      authUrl.searchParams.append('redirect_uri', redirectUri);
+      authUrl.searchParams.append('response_type', 'code');
+      authUrl.searchParams.append('state', encodedState);
+      // Optional: add scope if needed
+      // authUrl.searchParams.append('scope', 'READ_BOOKING WRITE_BOOKING');
+
+      console.log('🔄 Redirecting to Cal.com:', authUrl.toString());
+
+      // Redirect user to Cal.com
+      return res.redirect(authUrl.toString());
+    }
+
+    // ============================================
+    // STEP 2: Callback - Handle redirect FROM Cal.com
+    // ============================================
     if (!code || !state) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: 'Missing required parameters',
-        message: 'code and state are required'
+        message: 'This endpoint requires either:\n1. business_id (to start OAuth)\n2. code and state (OAuth callback)',
+        example: '/api/calcom/oauth?business_id=your-business-uuid'
       });
     }
 
@@ -49,69 +91,54 @@ module.exports = async (req, res) => {
       businessId = stateData.businessId;
     } catch (decodeError) {
       console.error('❌ Error decoding state:', decodeError);
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: 'Invalid state parameter',
         message: 'Could not decode business ID from state'
       });
     }
 
     if (!businessId) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: 'Missing business ID',
         message: 'State parameter did not contain business ID'
       });
     }
 
-    console.log('🔐 Processing Cal.com OAuth for business:', businessId);
+    console.log('🔐 Processing Cal.com OAuth callback for business:', businessId);
 
     // Exchange authorization code for access token
     const tokens = await exchangeCodeForToken(code);
-    
+
     console.log('✅ Successfully obtained Cal.com access token');
-
-    // Fetch event types to get the default one
-    // We'll need to make an API call with the new token
-    let defaultEventTypeId = null;
-    try {
-      // Temporarily use the new token to fetch event types
-      // (This is a bit hacky but works for the initial setup)
-      const axios = require('axios');
-      const eventTypesResponse = await axios.get('https://api.cal.com/v2/event-types', {
-        headers: {
-          'Authorization': `Bearer ${tokens.access_token}`,
-          'cal-api-version': '2024-08-13'
-        }
-      });
-
-      const eventTypes = eventTypesResponse.data?.data || [];
-      if (eventTypes.length > 0) {
-        // Use the first active event type as default
-        const activeEventType = eventTypes.find(et => et.active) || eventTypes[0];
-        defaultEventTypeId = activeEventType.id;
-        console.log('✅ Found default event type:', activeEventType.title);
-      }
-    } catch (eventTypeError) {
-      console.warn('⚠️ Could not fetch event types:', eventTypeError.message);
-      // Non-critical - business can configure this later
-    }
 
     // Store credentials in database
     await updateCalcomCredentials(businessId, {
       access_token: tokens.access_token,
       refresh_token: tokens.refresh_token,
       expires_at: tokens.expires_at,
-      event_type_id: defaultEventTypeId
+      event_type_id: null // Will be configured later
     });
 
     console.log('✅ Cal.com credentials stored successfully');
 
-    // Redirect to success page
-    return res.redirect(`/dashboard?success=calcom_connected&event_type_id=${defaultEventTypeId || 'none'}`);
+    // Return success response
+    return res.status(200).json({
+      success: true,
+      message: 'Cal.com connected successfully!',
+      businessId: businessId,
+      next_steps: [
+        'Set calcom_enabled = true in businesses table',
+        'Configure your event type in Cal.com',
+        'Test booking by calling your number'
+      ]
+    });
 
   } catch (error) {
-    console.error('❌ Error in Cal.com OAuth callback:', error);
-    
-    // Redirect to error page with details
-    return res.redirect(`/dashboard?error=calcom_setup_failed&message=${encodeURIComponent(error.message)}`);
+    console.error('❌ Error in Cal.com OAuth:', error);
+
+    return res.status(500).json({
+      error: 'OAuth failed',
+      message: error.message
+    });
   }
 };
