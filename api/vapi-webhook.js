@@ -273,31 +273,42 @@ async function handleFunctionCall(event, res) {
   const { call, functionCall } = event.message;
   const { name, parameters } = functionCall;
   const phoneNumber = getBusinessPhoneNumber(call, event.message);
+  const callId = call?.id;
 
-  console.log('🔧 Function call:', { name, parameters });
+  console.log('🔧 FUNCTION CALL:', { callId, name, parameters, timestamp: new Date().toISOString() });
 
   try {
     const business = await getBusinessByPhone(phoneNumber);
     if (!business) {
-      return res.status(200).json({ error: 'Business not found' });
+      console.error('❌ Business not found for phone:', phoneNumber);
+      return res.status(200).json({ 
+        error: 'Business not configured',
+        result: "I can't access the booking system right now. Let me take a message."
+      });
     }
+
+    console.log('✅ Business found:', business.name);
 
     // Check if booking is enabled
-    if ((name === 'checkAvailability' || name === 'createBooking') && !business.calcom_enabled) {
-      return res.status(200).json({
-        result: "Scheduling isn't available right now. Can I take a message for you?"
-      });
+    if ((name === 'checkAvailability' || name === 'createBooking')) {
+      if (!business.calcom_enabled) {
+        console.log('⚠️ calcom_enabled is false');
+        return res.status(200).json({
+          result: "Scheduling isn't available right now. Can I take a message for you?"
+        });
+      }
+
+      const calcomIntegration = await getCalcomCredentials(business.id);
+      if (!calcomIntegration?.access_token) {
+        console.log('⚠️ No Cal.com access token');
+        return res.status(200).json({
+          result: "Scheduling isn't available right now. Can I take a message for you?"
+        });
+      }
+      
+      console.log('✅ Cal.com ready');
     }
 
-    // Verify Cal.com credentials
-    const calcomIntegration = await getCalcomCredentials(business.id);
-    if ((name === 'checkAvailability' || name === 'createBooking') && !calcomIntegration?.access_token) {
-      return res.status(200).json({
-        result: "Scheduling isn't available right now. Can I take a message for you?"
-      });
-    }
-
-    // Route to handler
     switch (name) {
       case 'checkAvailability':
         return await handleCheckAvailability(business, parameters, res);
@@ -311,12 +322,19 @@ async function handleFunctionCall(event, res) {
         });
       
       default:
-        return res.status(200).json({ error: `Unknown function: ${name}` });
+        console.warn('⚠️ Unknown function:', name);
+        return res.status(200).json({ 
+          error: `Function ${name} not implemented`,
+          result: "I can't perform that action."
+        });
     }
 
   } catch (error) {
-    console.error('❌ Function error:', error);
-    return res.status(200).json({ error: error.message });
+    console.error('❌ Function call error:', error);
+    return res.status(200).json({ 
+      error: error.message,
+      result: "I encountered an error. Let me take a message."
+    });
   }
 }
 
@@ -417,10 +435,20 @@ async function handleCheckAvailability(business, parameters, res) {
 async function handleCreateBooking(business, call, parameters, res) {
   const { name, email, phone, dateTime, notes } = parameters;
   
-  console.log('✨ Creating booking:', { name, email, dateTime, business: business.name });
+  console.log('🔧 CREATE BOOKING CALLED:', { 
+    name, 
+    email, 
+    dateTime, 
+    business: business.name,
+    businessId: business.id,
+    calcomEnabled: business.calcom_enabled,
+    timestamp: new Date().toISOString()
+  });
 
   try {
     const { createCalcomBooking } = require('../lib/calcom');
+    
+    console.log('📡 Calling Cal.com API...');
     
     const calcomBooking = await createCalcomBooking(business.id, {
       name,
@@ -428,6 +456,12 @@ async function handleCreateBooking(business, call, parameters, res) {
       phone: phone || call?.customer?.number,
       start: dateTime,
       notes: notes || `Booked via AI assistant for ${business.name}`
+    });
+    
+    console.log('✅ BOOKING CREATED SUCCESSFULLY:', {
+      bookingId: calcomBooking?.id,
+      bookingUid: calcomBooking?.uid,
+      startTime: calcomBooking?.startTime
     });
 
     // Get or create call record
@@ -472,9 +506,18 @@ async function handleCreateBooking(business, call, parameters, res) {
     });
 
   } catch (error) {
-    console.error('❌ Booking creation failed:', error);
+    console.error('❌ BOOKING CREATION FAILED:', {
+      error: error.message,
+      stack: error.stack,
+      response: error.response?.data,
+      status: error.response?.status,
+      business: business.name,
+      timestamp: new Date().toISOString()
+    });
+    
     return res.status(200).json({
-      error: 'Unable to create booking. Let me take a message for you.'
+      error: `Booking failed: ${error.message}`,
+      result: "I wasn't able to complete the booking. Let me take a message and have someone follow up with you."
     });
   }
 }
