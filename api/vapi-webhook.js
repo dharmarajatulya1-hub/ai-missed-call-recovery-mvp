@@ -117,8 +117,8 @@ function isTestCall(call) {
  * schema, so a withheld caller ID must still resolve to a value. Single source
  * of truth for the payload shape used by every webhook handler.
  */
-function callRecordPayload(business, call, phoneNumber, extra = {}) {
-  const caller = call?.customer?.number || 'unknown';
+function callRecordPayload(business, call, phoneNumber, extra = {}, callerNumber = null) {
+  const caller = callerNumber || call?.customer?.number || 'unknown';
   return {
     business_id: business.id,
     vapi_call_id: call?.id,
@@ -127,6 +127,24 @@ function callRecordPayload(business, call, phoneNumber, extra = {}) {
     to_phone: phoneNumber || getBusinessPhoneNumberQuiet(call) || 'unknown',
     ...extra
   };
+}
+
+/**
+ * Normalize a US phone to E.164 (+1XXXXXXXXXX). Prefers the spoken/typed value,
+ * falls back to the caller ID, then to the raw string. Used so captured
+ * callback numbers are stored consistently (the model often gives bare digits).
+ */
+function toE164(raw, fallbackCaller) {
+  const norm = (p) => {
+    if (!p) return null;
+    const cleaned = String(p).replace(/[^\d+]/g, '');
+    if (/^\+[1-9]\d{6,14}$/.test(cleaned)) return cleaned;
+    const digits = cleaned.replace(/\D/g, '');
+    if (digits.length === 10) return `+1${digits}`;
+    if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
+    return null;
+  };
+  return norm(raw) || norm(fallbackCaller) || (raw ? String(raw) : (fallbackCaller || 'unknown'));
 }
 
 /**
@@ -478,13 +496,25 @@ async function handleToolCalls(event, res) {
  * Handle end-of-call-report: Finalize call data
  */
 async function handleEndOfCallReport(event, res) {
-  const { call, endedReason, summary, transcript, recording, analysis } = event.message;
-  const phoneNumber = getBusinessPhoneNumber(call, event.message);
+  const message = event.message;
+  const { call, endedReason, summary, transcript, recording, analysis } = message;
+  const phoneNumber = getBusinessPhoneNumber(call, message);
   const testMode = isTestCall(call);
 
-  console.log('📋 End of call:', { 
-    callId: call?.id, 
-    duration: call?.duration,
+  // Duration/timing and the recording URL live at the message level in VAPI's
+  // end-of-call-report — the `call` object here is minimal ({ id }).
+  let durationSeconds = null;
+  if (message.durationSeconds != null) durationSeconds = Math.round(message.durationSeconds);
+  else if (message.durationMs != null) durationSeconds = Math.round(message.durationMs / 1000);
+  else if (call?.duration != null) durationSeconds = call.duration;
+  const startedAtRaw = message.startedAt || call?.startedAt || null;
+  const endedAtRaw = message.endedAt || call?.endedAt || null;
+  const recordingUrl = message.recordingUrl || message.artifact?.recordingUrl || recording?.url || null;
+  const callerNumber = call?.customer?.number || message.customer?.number || null;
+
+  console.log('📋 End of call:', {
+    callId: call?.id,
+    durationSeconds,
     reason: endedReason,
     testMode
   });
@@ -507,11 +537,11 @@ async function handleEndOfCallReport(event, res) {
 
     const callRecord = await upsertCall(callRecordPayload(business, call, phoneNumber, {
       status: 'completed',
-      started_at: call?.startedAt ? new Date(call.startedAt).toISOString() : null,
-      ended_at: call?.endedAt ? new Date(call.endedAt).toISOString() : null,
-      duration_seconds: call?.duration || null,
+      started_at: startedAtRaw ? new Date(startedAtRaw).toISOString() : null,
+      ended_at: endedAtRaw ? new Date(endedAtRaw).toISOString() : null,
+      duration_seconds: durationSeconds,
       ended_reason: endedReason,
-      recording_url: recording?.url,
+      recording_url: recordingUrl,
       full_transcript: transcript,
       summary: summary,
       sentiment,
@@ -520,7 +550,7 @@ async function handleEndOfCallReport(event, res) {
         vapi_analysis: analysis,
         vapi_call: call
       }
-    }));
+    }, callerNumber));
 
     // Fire per-call reports (email default, SMS opt-in). Never let a report
     // failure fail the webhook — that would trigger VAPI retry storms.
@@ -829,7 +859,7 @@ async function handleCaptureBookingRequest(business, call, parameters) {
     timestamp: new Date().toISOString()
   });
 
-  const callbackPhone = phone || call?.customer?.number || 'unknown';
+  const callbackPhone = toE164(phone, call?.customer?.number);
   const preferred = Array.isArray(preferredTimes)
     ? preferredTimes
     : (preferredTimes ? [String(preferredTimes)] : []);
@@ -881,7 +911,7 @@ async function handleScheduleCallback(business, call, parameters) {
       business_id: business.id,
       call_id: callRecord.id,
       customer_name: 'Unknown caller',
-      customer_phone: call?.customer?.number || 'unknown',
+      customer_phone: toE164(null, call?.customer?.number),
       customer_email: null,
       service: 'callback',
       preferred_times: preferredTime ? [String(preferredTime)] : [],
