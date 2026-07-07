@@ -41,7 +41,19 @@ Caller → Twilio number → api/webhook.js  (validates Twilio sig, forwards to 
 
 Plan Phases 0–4 are implemented (migrations 007–009 add `booking_requests`, `booking_mode`, report flags, `ai_config`). Resolved former landmines: VAPI webhook now requires `x-vapi-secret`; Twilio sig fails closed; `prompt-preview` fails closed on unset `DEBUG_SECRET`; the unauthenticated `debug/test-calcom` + `calcom/availability` + `calcom/book` endpoints were deleted; timezone reads `businesses.timezone` everywhere; `custom_greeting` is live; `endCallPhrases` no longer contains bare `'Goodbye'`/`'Take care'`; transcript sequencing uses NULL + `spoken_at` (no in-memory Map); `scheduleCallback` + `captureBookingRequest` persist to `booking_requests`; `vercel.json` has the digest cron; `analysisPlan` is set; `ai_config` exists; dead pre-VAPI files removed.
 
+## Shipped 2026-07-07 (session 2)
+
+Infra + polish on top of Phase 0–4. New Supabase project (`lsouhkcmzgsbejtvsefo`) migrated (001–010) + seeded (HVAC test business on `+19846007391`); Vercel prod env set. Migration 010 made transcript `sequence_number` nullable. Duration/phone-capture fix merged (PR #3, `d1da9b0`).
+
+- **Email is live to real customers.** Resend sending domain `send.svaraa.co` verified (DKIM/SPF/MX at Namecheap; root kept on PrivateEmail); `EMAIL_FROM=Svaraa <notifications@send.svaraa.co>` (was the `onboarding@resend.dev` test sender, which only reached the account owner).
+- **Per-call email redesigned** (branded HTML) with the "Duration: n/a" bug fixed (`sendCallReports` now takes the message-level `durationSeconds` instead of recomputing from the minimal `call` object) and phone numbers formatted. **Merged (PR #4, `8372af6`) but NOT yet deployed to prod** — the redesign + duration-in-email fix go live only on the next `vercel --prod`.
+- **Onboarding is one JSON + one command:** `scripts/onboard-business.js` (config-driven, idempotent by phone, `--dry-run`/`--preview`) + `scripts/business.example.json` + `docs/ONBOARDING-RUNBOOK.md`.
+- **Toll-free SMS submitted:** platform number `+18448412214` purchased; toll-free verification filed, in carrier review (~1–4 wks). SMS code stays flag-gated (`sms_report_enabled`) until it clears.
+- **Landing site** (`svaraa.co`, separate repo `dharmarajatulya1-hub/ai-missed-call-recovery`, **CLI-deployed via `vercel --prod`, not git auto-deploy**) now has `/privacy`, `/terms`, an SMS consent checkbox on the signup form, and an `/optin` opt-in-proof page.
+
 ## Remaining landmines / watch-items
+
+- **PR #4 is merged but prod is not redeployed** — the branded email + duration-in-email fix are on `main` only. Run `vercel --prod` in the MVP repo to ship them. `EMAIL_FROM` must stay on the verified `send.svaraa.co` domain or real-customer sends break.
 
 - **`VAPI_WEBHOOK_SECRET` is now required.** The webhook fails closed — if it is unset in Vercel env **and** the VAPI dashboard Server settings, every call breaks. Same for `PUBLIC_BASE_URL` (per-assistant server URL) and `DEBUG_SECRET` (prompt-preview).
 - **Model is `gpt-4o-mini`** (chosen for cost/latency). Weaker function-calling than `gpt-4o`; if live Cal.com calls mis-loop on `checkAvailability`, bump those rows via `ai_config.model='gpt-4o'`. Tool-use rules + 2-call cap are the mitigation.
