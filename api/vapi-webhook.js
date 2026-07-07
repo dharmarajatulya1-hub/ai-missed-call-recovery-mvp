@@ -22,6 +22,9 @@ const {
   upsertCall,
   insertTranscript,
   createBooking,
+  getBookingByCall,
+  insertBookingRequest,
+  getBookingRequestByCall,
   getCalcomCredentials
 } = require('../lib/supabase');
 
@@ -31,10 +34,9 @@ const {
   buildBookingConfig,
   ASSISTANT_TYPES
 } = require('../lib/vapi');
-const { APP_TIME_ZONE, getCurrentDateInAppTimeZone } = require('../lib/time');
-
-// Transcript sequence tracking (in-memory, per-instance)
-const transcriptSequences = new Map();
+const { APP_TIME_ZONE, getCurrentDateInTimeZone } = require('../lib/time');
+const { sendEmail, escapeHtml } = require('../lib/email');
+const { sendSMS } = require('../lib/twilio');
 
 /**
  * Main webhook handler
@@ -42,6 +44,16 @@ const transcriptSequences = new Map();
 module.exports = async (req, res) => {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  // Authenticate the webhook. VAPI sends the per-assistant/server secret in
+  // `x-vapi-secret`. Refuse to serve if the secret is unset (fail closed) or
+  // the provided value does not match — forged events could otherwise create
+  // real Cal.com bookings or inject text into the owner's digest.
+  const providedSecret = req.headers['x-vapi-secret'];
+  if (!process.env.VAPI_WEBHOOK_SECRET || providedSecret !== process.env.VAPI_WEBHOOK_SECRET) {
+    console.warn('⚠️ Rejected VAPI webhook with missing/invalid x-vapi-secret');
+    return res.status(401).json({ error: 'Unauthorized' });
   }
 
   try {
@@ -100,6 +112,24 @@ function isTestCall(call) {
 }
 
 /**
+ * Build a `calls` upsert payload with safe NOT NULL fallbacks.
+ * `customer_phone`, `from_phone`, and `to_phone` are all NOT NULL in the
+ * schema, so a withheld caller ID must still resolve to a value. Single source
+ * of truth for the payload shape used by every webhook handler.
+ */
+function callRecordPayload(business, call, phoneNumber, extra = {}) {
+  const caller = call?.customer?.number || 'unknown';
+  return {
+    business_id: business.id,
+    vapi_call_id: call?.id,
+    customer_phone: caller,
+    from_phone: caller,
+    to_phone: phoneNumber || getBusinessPhoneNumberQuiet(call) || 'unknown',
+    ...extra
+  };
+}
+
+/**
  * Handle assistant-request: Return dynamic assistant configuration
  */
 async function handleAssistantRequest(event, res) {
@@ -123,45 +153,68 @@ async function handleAssistantRequest(event, res) {
 
     console.log('✅ Found business:', business.name);
 
-    // Only create call record for real calls (not test calls)
+    // Persist the 'queued' call record. Awaited on purpose: in Vercel
+    // serverless a fire-and-forget promise can be frozen after the response
+    // returns, and for a call with no later events this is the only record —
+    // losing it means a missed call vanishes from the dashboard/digest.
     if (!testMode) {
-      await upsertCall({
-        business_id: business.id,
-        vapi_call_id: call?.id,
-        customer_phone: call?.customer?.number,
-        from_phone: call?.customer?.number || 'unknown',
-        to_phone: phoneNumber || 'unknown',
+      await upsertCall(callRecordPayload(business, call, phoneNumber, {
         status: 'queued',
         direction: 'inbound',
         metadata: { vapi_call: call }
-      });
+      }));
     } else {
       console.log('🧪 Test call - skipping DB insert');
     }
 
     // Check Cal.com integration
     const calcomIntegration = await getCalcomCredentials(business.id);
-    const hasCalcom = !!(business.calcom_enabled && calcomIntegration?.access_token);
+    const hasCalcomToken = !!(business.calcom_enabled && calcomIntegration?.access_token);
 
-    // Build appropriate config
-    // TODO: Get voice preference from business.ai_config in the future
+    // Resolve the booking mode. Driven by business.booking_mode, with two guards:
+    // an explicit appointment_handling_enabled=false always wins (owner opted
+    // out); 'live' requires a valid Cal.com token else it degrades to capture.
+    let bookingMode = business.booking_mode || 'capture';
+    if (business.appointment_handling_enabled === false) {
+      bookingMode = 'none';
+    } else if (bookingMode === 'live' && !hasCalcomToken) {
+      console.warn(`⚠️ booking_mode=live but no Cal.com token for ${business.id}; degrading to capture`);
+      bookingMode = 'capture';
+    }
+
+    // Voice preset resolves in getVoiceConfig: ai_config.voice_preset →
+    // ai_voice_preset column → default (Sarah). Not hardcoded here.
     const voiceOptions = {
-      voicePreset: 'tara',
       appointmentHandlingEnabled: business.appointment_handling_enabled
-    }; // Using Tara (VAPI voice) as default
-    
+    };
+
     let config;
-    if (hasCalcom) {
+    if (bookingMode === 'live') {
       config = buildBookingConfig(business, calcomIntegration, voiceOptions);
-      console.log('✅ Booking config generated with Cal.com + Tara voice');
+      console.log('✅ Live booking config (Cal.com) generated');
+    } else if (bookingMode === 'capture') {
+      config = buildAssistantConfig(business, {
+        type: ASSISTANT_TYPES.BASIC,
+        enableBooking: false,
+        enableCapture: true,
+        ...voiceOptions
+      });
+      console.log('✅ Capture-and-confirm config generated');
+    } else if (bookingMode === 'callback') {
+      config = buildAssistantConfig(business, {
+        type: ASSISTANT_TYPES.BASIC,
+        enableBooking: false,
+        enableCallback: true,
+        ...voiceOptions
+      });
+      console.log('✅ Callback config generated');
     } else {
       config = buildAssistantConfig(business, {
         type: ASSISTANT_TYPES.BASIC,
         enableBooking: false,
-        enableCallback: business.appointment_handling_enabled,
         ...voiceOptions
       });
-      console.log('✅ Basic config generated with Tara voice');
+      console.log('✅ Basic (no scheduling) config generated');
     }
 
     // Debug: Log the generated prompt (remove in production)
@@ -200,16 +253,11 @@ async function handleStatusUpdate(event, res) {
       return res.status(200).json({ received: true });
     }
 
-    await upsertCall({
-      business_id: business.id,
-      vapi_call_id: call?.id,
-      customer_phone: call?.customer?.number,
-      from_phone: call?.customer?.number || 'unknown',
-      to_phone: phoneNumber || 'unknown',
+    await upsertCall(callRecordPayload(business, call, phoneNumber, {
       status: mapVapiStatus(status),
       started_at: call?.startedAt ? new Date(call.startedAt).toISOString() : null,
       metadata: { vapi_status: status }
-    });
+    }));
 
   } catch (error) {
     console.error('❌ Error updating status:', error);
@@ -244,24 +292,17 @@ async function handleTranscript(event, res) {
       return res.status(200).json({ received: true });
     }
 
-    const callRecord = await upsertCall({
-      business_id: business.id,
-      vapi_call_id: call?.id,
-      customer_phone: call?.customer?.number,
-      from_phone: call?.customer?.number || 'unknown',
-      to_phone: phoneNumber || 'unknown'
-    });
+    const callRecord = await upsertCall(callRecordPayload(business, call, phoneNumber));
 
-    // Track sequence
-    const callKey = call?.id;
-    const sequence = (transcriptSequences.get(callKey) || 0) + 1;
-    transcriptSequences.set(callKey, sequence);
-
+    // No in-memory sequence counter: it reset per lambda instance and caused
+    // duplicate sequence numbers → unique-constraint collisions → dropped
+    // lines. Persist with a NULL sequence (the unique index tolerates NULLs)
+    // and reconstruct order from spoken_at.
     await insertTranscript(
       callRecord.id,
       role === 'user' ? 'user' : 'assistant',
       transcript,
-      sequence
+      null
     );
 
   } catch (error) {
@@ -314,10 +355,11 @@ async function executeFunctionCall(call, message, name, parameters) {
     case 'createBooking':
       return await handleCreateBooking(business, call, parameters);
 
+    case 'captureBookingRequest':
+      return await handleCaptureBookingRequest(business, call, parameters);
+
     case 'scheduleCallback':
-      return {
-        result: "I've noted your request for a callback. Someone will contact you soon."
-      };
+      return await handleScheduleCallback(business, call, parameters);
 
     default:
       console.warn('⚠️ Unknown function:', name);
@@ -336,7 +378,7 @@ async function handleFunctionCall(event, res) {
   const { name, parameters } = functionCall;
   const callId = call?.id;
 
-  console.log('🔧 FUNCTION CALL:', { callId, name, parameters, timestamp: new Date().toISOString() });
+  console.log('🔧 FUNCTION CALL:', { callId, name, timestamp: new Date().toISOString() });
 
   try {
     const payload = await executeFunctionCall(call, event.message, name, parameters);
@@ -400,7 +442,9 @@ async function handleToolCalls(event, res) {
     timestamp: new Date().toISOString()
   });
 
-  console.log('🧾 RAW TOOL CALL PAYLOAD:', JSON.stringify(toolCallList));
+  if (process.env.NODE_ENV !== 'production') {
+    console.log('🧾 RAW TOOL CALL PAYLOAD:', JSON.stringify(toolCallList));
+  }
 
   try {
     const results = [];
@@ -456,12 +500,12 @@ async function handleEndOfCallReport(event, res) {
       return res.status(200).json({ received: true });
     }
 
-    await upsertCall({
-      business_id: business.id,
-      vapi_call_id: call?.id,
-      customer_phone: call?.customer?.number,
-      from_phone: call?.customer?.number || 'unknown',
-      to_phone: phoneNumber || 'unknown',
+    // VAPI puts analysisPlan output under analysis.structuredData.
+    const structured = analysis?.structuredData || {};
+    const sentiment = structured.sentiment || analysis?.sentiment || null;
+    const intent = structured.intent || analysis?.intent || extractIntent(summary, transcript);
+
+    const callRecord = await upsertCall(callRecordPayload(business, call, phoneNumber, {
       status: 'completed',
       started_at: call?.startedAt ? new Date(call.startedAt).toISOString() : null,
       ended_at: call?.endedAt ? new Date(call.endedAt).toISOString() : null,
@@ -470,22 +514,128 @@ async function handleEndOfCallReport(event, res) {
       recording_url: recording?.url,
       full_transcript: transcript,
       summary: summary,
-      sentiment: analysis?.sentiment || null,
-      intent: analysis?.intent || extractIntent(summary, transcript),
+      sentiment,
+      intent,
       metadata: {
         vapi_analysis: analysis,
         vapi_call: call
       }
-    });
+    }));
 
-    // Cleanup
-    transcriptSequences.delete(call?.id);
+    // Fire per-call reports (email default, SMS opt-in). Never let a report
+    // failure fail the webhook — that would trigger VAPI retry storms.
+    try {
+      const bookingRequest = await getBookingRequestByCall(callRecord?.id);
+      await sendCallReports({ business, call, summary, intent, bookingRequest });
+    } catch (reportError) {
+      console.error('❌ Per-call report failed (continuing):', reportError.message);
+    }
 
   } catch (error) {
     console.error('❌ Error saving end-of-call report:', error);
   }
 
   return res.status(200).json({ received: true });
+}
+
+/**
+ * Send per-call reports to the business owner: email (on by default) and SMS
+ * (opt-in paid add-on). Each channel is best-effort and isolated.
+ */
+async function sendCallReports({ business, call, summary, intent, bookingRequest }) {
+  const caller = call?.customer?.number || 'unknown';
+  const durationSeconds = call?.duration || 0;
+  const durationLabel = durationSeconds
+    ? `${Math.floor(durationSeconds / 60)}m ${durationSeconds % 60}s`
+    : 'n/a';
+  const summaryText = summary || 'No summary available.';
+
+  const bookingLines = bookingRequest
+    ? [
+        `Service: ${bookingRequest.service}`,
+        `Preferred times: ${(bookingRequest.preferred_times || []).join('; ') || 'none given'}`,
+        `Name: ${bookingRequest.customer_name}`,
+        `Callback: ${bookingRequest.customer_phone}`
+      ]
+    : null;
+
+  // ---- Email (default on) ----
+  if (business.call_summary_email_enabled !== false && business.email) {
+    try {
+      await sendEmail(buildCallSummaryEmail({
+        business, caller, durationLabel, intent, summaryText, bookingLines
+      }));
+    } catch (err) {
+      console.error('❌ Per-call email failed:', err.message);
+    }
+  }
+
+  // ---- SMS (opt-in) ----
+  if (business.sms_report_enabled && business.owner_notification_phone) {
+    try {
+      const smsLines = [
+        `${business.name}: call from ${caller}`,
+        `Intent: ${intent}`,
+        summaryText.slice(0, 160)
+      ];
+      if (bookingLines) {
+        smsLines.push(`Request — ${bookingRequest.service}, ${(bookingRequest.preferred_times || []).join('; ')}, ${bookingRequest.customer_phone}`);
+      }
+      await sendSMS(business.owner_notification_phone, smsLines.join('\n'));
+    } catch (err) {
+      console.error('❌ Per-call SMS failed:', err.message);
+    }
+  }
+}
+
+/**
+ * Build the per-call summary email payload.
+ */
+function buildCallSummaryEmail({ business, caller, durationLabel, intent, summaryText, bookingLines }) {
+  const dashboardLink = process.env.DASHBOARD_URL || '';
+  const subject = `New call — ${business.name} (${caller})`;
+
+  const bookingBlockText = bookingLines
+    ? `\n\nBOOKING REQUEST:\n${bookingLines.join('\n')}`
+    : '';
+
+  const text = [
+    `New call for ${business.name}`,
+    `Caller: ${caller}`,
+    `Duration: ${durationLabel}`,
+    `Intent: ${intent}`,
+    '',
+    'Summary:',
+    summaryText,
+    bookingBlockText,
+    dashboardLink ? `\nDashboard: ${dashboardLink}` : ''
+  ].filter(Boolean).join('\n');
+
+  const bookingBlockHtml = bookingLines
+    ? `
+      <div style="background:#eef6ff;border:1px solid #cfe3ff;padding:12px;border-radius:8px;margin-top:16px;">
+        <div style="font-weight:700;margin-bottom:6px;">Booking request</div>
+        ${bookingLines.map((l) => `<div>${escapeHtml(l)}</div>`).join('')}
+      </div>`
+    : '';
+
+  const html = `
+    <div style="font-family: Arial, sans-serif; color:#111; line-height:1.5;">
+      <h2 style="margin-bottom:4px;">New call</h2>
+      <p style="margin:0;"><strong>${escapeHtml(business.name)}</strong></p>
+      <table style="margin-top:12px;font-size:14px;">
+        <tr><td style="padding:2px 12px 2px 0;color:#666;">Caller</td><td>${escapeHtml(caller)}</td></tr>
+        <tr><td style="padding:2px 12px 2px 0;color:#666;">Duration</td><td>${escapeHtml(durationLabel)}</td></tr>
+        <tr><td style="padding:2px 12px 2px 0;color:#666;">Intent</td><td>${escapeHtml(intent)}</td></tr>
+      </table>
+      <h3 style="margin:16px 0 4px;">Summary</h3>
+      <p style="margin:0;">${escapeHtml(summaryText)}</p>
+      ${bookingBlockHtml}
+      ${dashboardLink ? `<p style="margin-top:16px;"><a href="${dashboardLink}">Open dashboard</a></p>` : ''}
+    </div>
+  `;
+
+  return { to: business.email, subject, html, text };
 }
 
 // ============================================================
@@ -497,13 +647,14 @@ async function handleCheckAvailability(business, parameters) {
   
   console.log('📅 Checking availability:', { date, timePreference, business: business.name });
 
-  const todayInBusinessTimezone = getCurrentDateInAppTimeZone();
+  const businessTimezone = business?.timezone || APP_TIME_ZONE;
+  const todayInBusinessTimezone = getCurrentDateInTimeZone(businessTimezone);
 
   if (!date || date < todayInBusinessTimezone) {
     console.warn('⚠️ Rejecting past availability date:', {
       requestedDate: date,
       todayInBusinessTimezone,
-      businessTimezone: APP_TIME_ZONE
+      businessTimezone
     });
 
     return {
@@ -523,7 +674,7 @@ async function handleCheckAvailability(business, parameters) {
           hour: 'numeric',
           minute: '2-digit',
           hour12: true,
-          timeZone: APP_TIME_ZONE
+          timeZone: businessTimezone
         })
       }));
       const formatted = slotOptions.map(slot => slot.display);
@@ -550,21 +701,48 @@ async function handleCheckAvailability(business, parameters) {
 async function handleCreateBooking(business, call, parameters) {
   const { name, email, phone, dateTime, notes } = parameters;
   
-  console.log('🔧 CREATE BOOKING CALLED:', { 
-    name, 
-    email, 
-    dateTime, 
-    business: business.name,
+  console.log('🔧 CREATE BOOKING CALLED:', {
+    callId: call?.id,
     businessId: business.id,
     calcomEnabled: business.calcom_enabled,
+    hasDateTime: !!dateTime,
     timestamp: new Date().toISOString()
   });
 
+  const businessTimezone = business?.timezone || APP_TIME_ZONE;
+  const formatTime = (iso) => new Date(iso).toLocaleString('en-US', {
+    weekday: 'long',
+    month: 'long',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+    timeZone: businessTimezone
+  });
+
   try {
+    // Idempotency pre-check (best-effort): a webhook redelivery or double model
+    // call must not create a second real Cal.com appointment. This runs BEFORE
+    // the Cal.com call, but a DB failure here must NOT abort an otherwise-healthy
+    // booking — so it is isolated and we proceed even if it throws.
+    let callRecord = null;
+    try {
+      callRecord = await upsertCall(callRecordPayload(business, call, null));
+      const existingBooking = await getBookingByCall(callRecord?.id);
+      if (existingBooking) {
+        console.log('↩️ Booking already exists for this call; skipping duplicate:', existingBooking.id);
+        return {
+          result: `You're all set — I already have your appointment booked for ${formatTime(existingBooking.scheduled_at)}. Is there anything else I can help you with?`
+        };
+      }
+    } catch (preCheckError) {
+      console.error('⚠️ Booking idempotency pre-check failed; proceeding with Cal.com:', preCheckError.message);
+    }
+
     const { createCalcomBooking } = require('../lib/calcom');
-    
+
     console.log('📡 Calling Cal.com API...');
-    
+
     const calcomBooking = await createCalcomBooking(business.id, {
       name,
       email,
@@ -573,34 +751,22 @@ async function handleCreateBooking(business, call, parameters) {
       notes: notes || `Booked via AI assistant for ${business.name}`
     });
     const scheduledAt = calcomBooking?.start || calcomBooking?.startTime || new Date(dateTime).toISOString();
-    
+
     console.log('✅ BOOKING CREATED SUCCESSFULLY:', {
       bookingId: calcomBooking?.id,
       bookingUid: calcomBooking?.uid,
       startTime: scheduledAt
     });
 
-    const formattedTime = new Date(scheduledAt).toLocaleString('en-US', {
-      weekday: 'long',
-      month: 'long',
-      day: 'numeric',
-      hour: 'numeric',
-      minute: '2-digit',
-      hour12: true,
-      timeZone: APP_TIME_ZONE
-    });
+    const formattedTime = formatTime(scheduledAt);
 
     try {
-      const callRecord = await upsertCall({
-        business_id: business.id,
-        vapi_call_id: call?.id,
-        customer_phone: call?.customer?.number,
-        from_phone: call?.customer?.number || 'unknown',
-        to_phone: getBusinessPhoneNumberQuiet(call) || 'unknown'
-      });
-
+      // Re-resolve the call record if the pre-check failed to produce one.
+      if (!callRecord) {
+        callRecord = await upsertCall(callRecordPayload(business, call, null));
+      }
       const calcomIntegration = await getCalcomCredentials(business.id);
-      
+
       await createBooking({
         business_id: business.id,
         call_id: callRecord.id,
@@ -616,11 +782,17 @@ async function handleCreateBooking(business, call, parameters) {
         notes: notes
       });
     } catch (persistenceError) {
-      console.error('⚠️ Booking saved in Cal.com but local persistence failed:', {
-        error: persistenceError.message,
-        bookingUid: calcomBooking?.uid,
-        business: business.name
-      });
+      // A unique violation (23505) means another delivery already recorded this
+      // call's booking — treat as already-booked, not a hard failure.
+      if (persistenceError.code === '23505') {
+        console.warn('↩️ Duplicate booking persistence ignored (already recorded):', callRecord.id);
+      } else {
+        console.error('⚠️ Booking saved in Cal.com but local persistence failed:', {
+          error: persistenceError.message,
+          bookingUid: calcomBooking?.uid,
+          business: business.name
+        });
+      }
     }
 
     return {
@@ -640,6 +812,93 @@ async function handleCreateBooking(business, call, parameters) {
     return {
       error: `Booking failed: ${error.message}`,
       result: "I wasn't able to complete the booking. Let me take a message and have someone follow up with you."
+    };
+  }
+}
+
+/**
+ * Persist a capture-and-confirm booking request (no live availability lookup).
+ */
+async function handleCaptureBookingRequest(business, call, parameters) {
+  const { name, phone, email, service, preferredTimes, notes } = parameters;
+
+  console.log('📝 CAPTURE BOOKING REQUEST:', {
+    callId: call?.id,
+    businessId: business.id,
+    hasPreferredTimes: Array.isArray(preferredTimes) ? preferredTimes.length : 0,
+    timestamp: new Date().toISOString()
+  });
+
+  const callbackPhone = phone || call?.customer?.number || 'unknown';
+  const preferred = Array.isArray(preferredTimes)
+    ? preferredTimes
+    : (preferredTimes ? [String(preferredTimes)] : []);
+
+  try {
+    const callRecord = await upsertCall(callRecordPayload(business, call, null));
+
+    await insertBookingRequest({
+      business_id: business.id,
+      call_id: callRecord.id,
+      customer_name: name || 'Unknown caller',
+      customer_phone: callbackPhone,
+      customer_email: email || null,
+      service: service || 'appointment',
+      preferred_times: preferred,
+      notes: notes || null,
+      status: 'new'
+    });
+
+    return {
+      result: "Got it — I've passed your request to the team; they'll call you back to confirm the exact time. Is there anything else I can help you with?"
+    };
+  } catch (error) {
+    console.error('❌ Failed to capture booking request:', error.message);
+    return {
+      error: 'Unable to save booking request',
+      result: "I had trouble saving that just now. Let me make sure the team follows up — can you confirm the best number to reach you?"
+    };
+  }
+}
+
+/**
+ * Persist a callback request. Folded into booking_requests as a
+ * service='callback' row so nothing is silently dropped.
+ */
+async function handleScheduleCallback(business, call, parameters) {
+  const { preferredTime, reason } = parameters;
+
+  console.log('📞 SCHEDULE CALLBACK:', {
+    callId: call?.id,
+    businessId: business.id,
+    timestamp: new Date().toISOString()
+  });
+
+  try {
+    const callRecord = await upsertCall(callRecordPayload(business, call, null));
+
+    await insertBookingRequest({
+      business_id: business.id,
+      call_id: callRecord.id,
+      customer_name: 'Unknown caller',
+      customer_phone: call?.customer?.number || 'unknown',
+      customer_email: null,
+      service: 'callback',
+      preferred_times: preferredTime ? [String(preferredTime)] : [],
+      notes: reason || null,
+      status: 'new'
+    });
+
+    return {
+      result: "I've noted your request for a callback. Someone from the team will contact you soon."
+    };
+  } catch (error) {
+    // Do NOT claim success on failure — that re-introduces the exact
+    // "callback persists nothing" landmine. Be honest and reconfirm.
+    console.error('❌ Failed to persist callback request:', error.message);
+    return {
+      error: 'Unable to save callback request',
+      result: "I had trouble noting that just now — could you confirm the best number for the team to reach you?"
     };
   }
 }

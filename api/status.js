@@ -11,10 +11,10 @@ module.exports = async (req, res) => {
     timestamp: new Date().toISOString(),
     environment: process.env.NODE_ENV || 'production',
     endpoints: {
-      webhook: '/api/webhook',
-      handleSpeech: '/api/handle-speech',
-      handleRecording: '/api/handle-recording',
-      transcription: '/api/transcription',
+      twilioWebhook: '/api/webhook',
+      vapiWebhook: '/api/vapi-webhook',
+      calcomOauth: '/api/calcom/oauth',
+      dailyDigest: '/api/cron/daily-digest',
       status: '/api/status'
     }
   });
