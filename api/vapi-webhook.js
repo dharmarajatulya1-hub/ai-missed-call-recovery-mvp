@@ -556,7 +556,7 @@ async function handleEndOfCallReport(event, res) {
     // failure fail the webhook — that would trigger VAPI retry storms.
     try {
       const bookingRequest = await getBookingRequestByCall(callRecord?.id);
-      await sendCallReports({ business, call, summary, intent, bookingRequest });
+      await sendCallReports({ business, call, summary, intent, bookingRequest, durationSeconds, callerNumber });
     } catch (reportError) {
       console.error('❌ Per-call report failed (continuing):', reportError.message);
     }
@@ -572,20 +572,22 @@ async function handleEndOfCallReport(event, res) {
  * Send per-call reports to the business owner: email (on by default) and SMS
  * (opt-in paid add-on). Each channel is best-effort and isolated.
  */
-async function sendCallReports({ business, call, summary, intent, bookingRequest }) {
-  const caller = call?.customer?.number || 'unknown';
-  const durationSeconds = call?.duration || 0;
-  const durationLabel = durationSeconds
-    ? `${Math.floor(durationSeconds / 60)}m ${durationSeconds % 60}s`
+async function sendCallReports({ business, call, summary, intent, bookingRequest, durationSeconds = null, callerNumber = null }) {
+  const caller = formatPhoneDisplay(callerNumber || call?.customer?.number);
+  // Duration is computed at the message level upstream (the `call` object here
+  // is minimal), so prefer the passed value; only fall back to call.duration.
+  const seconds = durationSeconds != null ? durationSeconds : (call?.duration || 0);
+  const durationLabel = seconds
+    ? `${Math.floor(seconds / 60)}m ${seconds % 60}s`
     : 'n/a';
   const summaryText = summary || 'No summary available.';
 
   const bookingLines = bookingRequest
     ? [
-        `Service: ${bookingRequest.service}`,
-        `Preferred times: ${(bookingRequest.preferred_times || []).join('; ') || 'none given'}`,
-        `Name: ${bookingRequest.customer_name}`,
-        `Callback: ${bookingRequest.customer_phone}`
+        { label: 'Service', value: bookingRequest.service },
+        { label: 'Preferred times', value: (bookingRequest.preferred_times || []).join('; ') || 'none given' },
+        { label: 'Name', value: bookingRequest.customer_name },
+        { label: 'Callback', value: formatPhoneDisplay(bookingRequest.customer_phone) }
       ]
     : null;
 
@@ -621,19 +623,37 @@ async function sendCallReports({ business, call, summary, intent, bookingRequest
 /**
  * Build the per-call summary email payload.
  */
+/**
+ * Format a phone number for display: +15135921240 → (513) 592-1240.
+ * Falls back to the raw value for non-US / unparseable numbers.
+ */
+function formatPhoneDisplay(raw) {
+  if (!raw) return 'unknown';
+  const digits = String(raw).replace(/\D/g, '');
+  const ten = digits.length === 11 && digits.startsWith('1') ? digits.slice(1) : digits;
+  if (ten.length === 10) return `(${ten.slice(0, 3)}) ${ten.slice(3, 6)}-${ten.slice(6)}`;
+  return String(raw);
+}
+
+/**
+ * Build the per-call summary email payload — branded, email-safe HTML
+ * (table layout + inline styles) plus a plaintext fallback.
+ */
 function buildCallSummaryEmail({ business, caller, durationLabel, intent, summaryText, bookingLines }) {
   const dashboardLink = process.env.DASHBOARD_URL || '';
-  const subject = `New call — ${business.name} (${caller})`;
+  const businessName = business.name;
+  const intentLabel = intent ? intent.charAt(0).toUpperCase() + intent.slice(1) : 'General';
+  const subject = `New call — ${businessName} (${caller})`;
 
+  // ---- Plaintext fallback ----
   const bookingBlockText = bookingLines
-    ? `\n\nBOOKING REQUEST:\n${bookingLines.join('\n')}`
+    ? `\n\nBOOKING REQUEST\n${bookingLines.map((l) => `${l.label}: ${l.value}`).join('\n')}`
     : '';
-
   const text = [
-    `New call for ${business.name}`,
+    `New call for ${businessName}`,
     `Caller: ${caller}`,
     `Duration: ${durationLabel}`,
-    `Intent: ${intent}`,
+    `Intent: ${intentLabel}`,
     '',
     'Summary:',
     summaryText,
@@ -641,29 +661,83 @@ function buildCallSummaryEmail({ business, caller, durationLabel, intent, summar
     dashboardLink ? `\nDashboard: ${dashboardLink}` : ''
   ].filter(Boolean).join('\n');
 
+  // ---- Branded HTML ----
+  const detailRow = (label, value) => `
+                <tr>
+                  <td style="padding:6px 0;color:#8A8175;font-size:13px;width:92px;vertical-align:top;">${label}</td>
+                  <td style="padding:6px 0;color:#23201B;font-size:14px;font-weight:600;">${value}</td>
+                </tr>`;
+
   const bookingBlockHtml = bookingLines
     ? `
-      <div style="background:#eef6ff;border:1px solid #cfe3ff;padding:12px;border-radius:8px;margin-top:16px;">
-        <div style="font-weight:700;margin-bottom:6px;">Booking request</div>
-        ${bookingLines.map((l) => `<div>${escapeHtml(l)}</div>`).join('')}
-      </div>`
+            <tr><td style="padding:8px 24px 0;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#EBF0EA;border:1px solid #D6E1D3;border-radius:10px;">
+                <tr><td style="padding:16px 18px;">
+                  <div style="font-family:Georgia,'Times New Roman',serif;font-size:15px;font-weight:bold;color:#2E5A49;margin-bottom:8px;">Booking request</div>
+                  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-family:Arial,sans-serif;">
+                    ${bookingLines.map((l) => `
+                    <tr>
+                      <td style="padding:3px 0;color:#5B6B60;font-size:13px;width:112px;vertical-align:top;">${escapeHtml(l.label)}</td>
+                      <td style="padding:3px 0;color:#23201B;font-size:14px;font-weight:600;">${escapeHtml(l.value)}</td>
+                    </tr>`).join('')}
+                  </table>
+                </td></tr>
+              </table>
+            </td></tr>`
     : '';
 
-  const html = `
-    <div style="font-family: Arial, sans-serif; color:#111; line-height:1.5;">
-      <h2 style="margin-bottom:4px;">New call</h2>
-      <p style="margin:0;"><strong>${escapeHtml(business.name)}</strong></p>
-      <table style="margin-top:12px;font-size:14px;">
-        <tr><td style="padding:2px 12px 2px 0;color:#666;">Caller</td><td>${escapeHtml(caller)}</td></tr>
-        <tr><td style="padding:2px 12px 2px 0;color:#666;">Duration</td><td>${escapeHtml(durationLabel)}</td></tr>
-        <tr><td style="padding:2px 12px 2px 0;color:#666;">Intent</td><td>${escapeHtml(intent)}</td></tr>
+  const dashboardBtnHtml = dashboardLink
+    ? `
+            <tr><td style="padding:20px 24px 0;">
+              <a href="${dashboardLink}" style="display:inline-block;background:#C2603F;color:#ffffff;text-decoration:none;font-family:Arial,sans-serif;font-size:14px;font-weight:600;padding:11px 22px;border-radius:8px;">Open dashboard &rarr;</a>
+            </td></tr>`
+    : '';
+
+  const html = `<!DOCTYPE html>
+<html>
+<body style="margin:0;padding:0;background:#FBF7F0;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#FBF7F0;padding:28px 12px;">
+    <tr><td align="center">
+      <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
+        <tr><td style="padding:4px 8px 18px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+            <td style="vertical-align:middle;">
+              <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#C2603F;vertical-align:middle;"></span>
+              <span style="font-family:Georgia,'Times New Roman',serif;font-size:22px;font-weight:bold;color:#23201B;vertical-align:middle;margin-left:8px;">Svaraa</span>
+            </td>
+            <td align="right" style="font-family:Arial,sans-serif;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#8A8175;vertical-align:middle;">New call</td>
+          </tr></table>
+        </td></tr>
+        <tr><td style="background:#ffffff;border:1px solid #EBE2D2;border-radius:14px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+            <tr><td style="padding:24px 24px 4px;">
+              <div style="font-family:Georgia,'Times New Roman',serif;font-size:20px;font-weight:bold;color:#23201B;">${escapeHtml(businessName)}</div>
+              <div style="font-family:Arial,sans-serif;font-size:13px;color:#8A8175;margin-top:2px;">You have a new call to follow up on.</div>
+            </td></tr>
+            <tr><td style="padding:12px 24px 4px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-family:Arial,sans-serif;">
+                ${detailRow('Caller', escapeHtml(caller))}
+                ${detailRow('Duration', escapeHtml(durationLabel))}
+                ${detailRow('Intent', escapeHtml(intentLabel))}
+              </table>
+            </td></tr>
+            <tr><td style="padding:14px 24px 0;">
+              <div style="font-family:Arial,sans-serif;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#8A8175;margin-bottom:6px;">Summary</div>
+              <div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.55;color:#33302A;">${escapeHtml(summaryText)}</div>
+            </td></tr>
+            ${bookingBlockHtml}
+            ${dashboardBtnHtml}
+            <tr><td style="padding:22px 24px;"></td></tr>
+          </table>
+        </td></tr>
+        <tr><td style="padding:16px 8px;font-family:Arial,sans-serif;font-size:12px;color:#A79D8C;">
+          Svaraa &middot; AI phone answering for local business
+        </td></tr>
       </table>
-      <h3 style="margin:16px 0 4px;">Summary</h3>
-      <p style="margin:0;">${escapeHtml(summaryText)}</p>
-      ${bookingBlockHtml}
-      ${dashboardLink ? `<p style="margin-top:16px;"><a href="${dashboardLink}">Open dashboard</a></p>` : ''}
-    </div>
-  `;
+    </td></tr>
+  </table>
+</body>
+</html>`;
 
   return { to: business.email, subject, html, text };
 }
