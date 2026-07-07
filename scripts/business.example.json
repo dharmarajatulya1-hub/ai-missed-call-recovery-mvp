@@ -1,0 +1,57 @@
+{
+  "business": {
+    "name": "Miller Plumbing",
+    "email": "owner@millerplumbing.com",
+    "timezone": "America/New_York",
+
+    "services": ["drain cleaning", "water heater repair", "leak detection", "installations"],
+    "specialties": ["24/7 emergency service"],
+
+    "hours": {
+      "mon": "08:00-17:00",
+      "tue": "08:00-17:00",
+      "wed": "08:00-17:00",
+      "thu": "08:00-17:00",
+      "fri": "08:00-17:00",
+      "sat": "09:00-13:00",
+      "sun": "closed"
+    },
+
+    "custom_greeting": "Hi there! Thanks for calling {{businessName}} — how can I help you today?",
+    "custom_closing": null,
+
+    "ai_instructions": "We serve the greater Raleigh area. Free estimates on new installs. We do not service commercial buildings.",
+    "faq_data": "Q: Do you offer emergency service? A: Yes, 24/7 for burst pipes and major leaks.\nQ: Do you charge for estimates? A: Estimates on installations are free.",
+
+    "booking_mode": "capture",
+    "appointment_handling_enabled": true,
+
+    "notifications": {
+      "call_summary_email_enabled": true,
+      "sms_report_enabled": false,
+      "owner_notification_phone": "+19195551234"
+    },
+
+    "ai": {
+      "vertical": "hvac",
+      "voice_preset": "sarah",
+      "personality": null,
+      "tone": null,
+      "model": null,
+      "silence_timeout": null
+    }
+  },
+
+  "phone": {
+    "number": "+19846007391",
+    "label": "main",
+    "twilio_sid": null,
+    "vapi_phone_number_id": null
+  },
+
+  "owner": {
+    "email": null,
+    "password": null,
+    "user_id": null
+  }
+}
