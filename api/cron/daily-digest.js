@@ -5,6 +5,7 @@
 
 const { supabaseService } = require('../../lib/supabase');
 const { APP_TIME_ZONE } = require('../../lib/time');
+const { sendEmail, escapeHtml } = require('../../lib/email');
 
 const CRON_SECRET = process.env.CRON_SECRET;
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
@@ -12,7 +13,8 @@ const EMAIL_FROM = process.env.EMAIL_FROM;
 const DASHBOARD_URL = process.env.DASHBOARD_URL;
 
 module.exports = async (req, res) => {
-  if (req.method !== 'POST') {
+  // Vercel Cron invokes with GET; also allow POST for manual triggers.
+  if (req.method !== 'GET' && req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
@@ -20,7 +22,10 @@ module.exports = async (req, res) => {
     return res.status(500).json({ error: 'CRON_SECRET not configured' });
   }
 
-  const providedSecret = req.headers['x-cron-secret'];
+  // Vercel Cron sends `Authorization: Bearer ${CRON_SECRET}`. Also accept the
+  // legacy `x-cron-secret` header for manual/curl triggers.
+  const bearer = (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '');
+  const providedSecret = req.headers['x-cron-secret'] || bearer;
   if (providedSecret !== CRON_SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
@@ -54,7 +59,7 @@ module.exports = async (req, res) => {
       processed += 1;
 
       try {
-        const timeZone = APP_TIME_ZONE;
+        const timeZone = business.digest_timezone || business.timezone || APP_TIME_ZONE;
         if (window === 'previous-day' && !shouldSendDigestNow(business, timeZone)) {
           continue;
         }
@@ -93,7 +98,11 @@ module.exports = async (req, res) => {
           continue;
         }
 
-        await markDigestSent(business.id);
+        // Only the scheduled previous-day run advances the idempotency stamp.
+        // A manual ?window=today/last24 preview must not block the real digest.
+        if (window === 'previous-day') {
+          await markDigestSent(business.id);
+        }
         sent += 1;
       } catch (err) {
         console.error('❌ Digest error for business:', business.id, err);
@@ -238,31 +247,6 @@ function buildDigestEmail({ business, recipient, timeZone, label, calls, stats }
   return { to: recipient, subject, html, text };
 }
 
-async function sendEmail({ to, subject, html, text }) {
-  const response = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${RESEND_API_KEY}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      from: EMAIL_FROM,
-      to,
-      subject,
-      html,
-      text
-    })
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    console.error('❌ Resend error:', response.status, errorText);
-    return { ok: false, error: errorText };
-  }
-
-  return { ok: true };
-}
-
 function shouldSendDigestNow(business, timeZone) {
   const digestTime = business.digest_time_local || '08:00';
   const [targetHour, targetMinute] = digestTime.split(':').map((part) => Number(part));
@@ -272,16 +256,22 @@ function shouldSendDigestNow(business, timeZone) {
   }
 
   const now = new Date();
-  const parts = getTimeZoneParts(now, timeZone);
-  if (parts.hour !== targetHour || parts.minute !== targetMinute) {
-    return false;
+
+  // Idempotency: at most one digest per local day.
+  if (business.last_digest_sent_at) {
+    const lastSentKey = getLocalDateKey(new Date(business.last_digest_sent_at), timeZone);
+    const todayKey = getLocalDateKey(now, timeZone);
+    if (lastSentKey === todayKey) {
+      return false;
+    }
   }
 
-  if (!business.last_digest_sent_at) return true;
-
-  const lastSentKey = getLocalDateKey(new Date(business.last_digest_sent_at), timeZone);
-  const todayKey = getLocalDateKey(now, timeZone);
-  return lastSentKey !== todayKey;
+  // Fire on the first invocation at or after the configured local time today.
+  // Tolerant of any cron cadence (an exact minute match would miss most ticks).
+  const parts = getTimeZoneParts(now, timeZone);
+  const nowMinutes = parts.hour * 60 + parts.minute;
+  const targetMinutes = targetHour * 60 + targetMinute;
+  return nowMinutes >= targetMinutes;
 }
 
 async function markDigestSent(businessId) {
@@ -440,13 +430,4 @@ function formatDateTime(dateString, timeZone) {
     minute: '2-digit',
     hour12: true
   }).format(new Date(dateString));
-}
-
-function escapeHtml(text) {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
 }

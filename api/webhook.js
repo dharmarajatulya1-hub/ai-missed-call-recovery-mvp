@@ -31,23 +31,28 @@ module.exports = async (req, res) => {
   }
 
   try {
-    // Validate the request is from Twilio (recommended for production)
+    // Validate the request is from Twilio. Fail closed: without a valid
+    // signature a forged request would trigger billed VAPI /call requests.
     const twilioSignature = req.headers['x-twilio-signature'];
     const authToken = process.env.TWILIO_AUTH_TOKEN;
-    
-    if (authToken && twilioSignature) {
-      const url = `https://${req.headers.host}${req.url}`;
-      const isValid = twilio.validateRequest(
-        authToken,
-        twilioSignature,
-        url,
-        req.body
-      );
-      
-      if (!isValid) {
-        console.error('❌ Invalid Twilio signature');
-        return res.status(403).json({ error: 'Invalid signature' });
-      }
+
+    if (!authToken) {
+      // Misconfiguration — refuse to serve rather than skip validation.
+      console.error('❌ TWILIO_AUTH_TOKEN not configured; refusing request');
+      return res.status(500).json({ error: 'Server misconfiguration' });
+    }
+
+    const url = `https://${req.headers.host}${req.url}`;
+    const isValid = twilioSignature && twilio.validateRequest(
+      authToken,
+      twilioSignature,
+      url,
+      req.body
+    );
+
+    if (!isValid) {
+      console.error('❌ Invalid or missing Twilio signature');
+      return res.status(403).json({ error: 'Invalid signature' });
     }
 
     // Extract call details from Twilio webhook payload
