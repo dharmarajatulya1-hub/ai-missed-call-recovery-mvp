@@ -167,13 +167,14 @@ function buildDigestEmail({ business, recipient, timeZone, label, calls, stats }
     .map(([intent, count]) => `${intent}: ${count}`)
     .join(', ');
 
-  const keyCalls = calls.slice(0, 5).map((call) => {
-    const time = formatDateTime(call.created_at, timeZone);
-    const from = call.from_phone || call.customer_phone || 'unknown';
-    const summary = call.summary ? call.summary.slice(0, 140) : 'No summary';
-    return `${time} | ${from} | ${call.status || 'unknown'} | ${summary}`;
-  });
+  const keyCalls = calls.slice(0, 5).map((call) => ({
+    time: formatDateTime(call.created_at, timeZone),
+    from: formatDigestPhone(call.from_phone || call.customer_phone),
+    status: call.status || 'unknown',
+    summary: call.summary ? call.summary.slice(0, 200) : 'No summary'
+  }));
 
+  // ---- Plaintext fallback ----
   const text = [
     `Daily Call Digest for ${business.name}`,
     `Date: ${label} (${timeZone})`,
@@ -183,68 +184,117 @@ function buildDigestEmail({ business, recipient, timeZone, label, calls, stats }
     `Top intents: ${topIntents || 'None'}`,
     '',
     'Key calls:',
-    keyCalls.length ? keyCalls.join('\n') : 'No calls recorded.',
+    keyCalls.length
+      ? keyCalls.map((c) => `${c.time} | ${c.from} | ${c.status} | ${c.summary}`).join('\n')
+      : 'No calls recorded.',
     '',
     dashboardLink ? `Dashboard: ${dashboardLink}` : ''
   ].filter(Boolean).join('\n');
 
-  const tableRows = keyCalls.length
-    ? keyCalls.map((c) => {
-        const [time, from, status, summary] = c.split(' | ');
-        return `
-          <tr>
-            <td style="padding: 8px; border-bottom: 1px solid #eee;">${escapeHtml(time || '')}</td>
-            <td style="padding: 8px; border-bottom: 1px solid #eee;">${escapeHtml(from || '')}</td>
-            <td style="padding: 8px; border-bottom: 1px solid #eee;">${escapeHtml(status || '')}</td>
-            <td style="padding: 8px; border-bottom: 1px solid #eee;">${escapeHtml(summary || '')}</td>
-          </tr>
-        `;
-      }).join('')
-    : `
-      <tr>
-        <td colspan="4" style="padding: 8px; text-align: center; color: #666;">No calls recorded.</td>
-      </tr>
-    `;
+  // ---- Branded HTML (matches the per-call summary email) ----
+  const statTile = (labelText, value, valueSize = '26px') => `
+              <td width="33.33%" style="padding:6px;">
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F7F1E7;border:1px solid #EBE2D2;border-radius:10px;">
+                  <tr><td style="padding:14px 16px;">
+                    <div style="font-family:Arial,sans-serif;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#8A8175;">${labelText}</div>
+                    <div style="font-family:Georgia,'Times New Roman',serif;font-size:${valueSize};font-weight:bold;color:#23201B;margin-top:4px;">${value}</div>
+                  </td></tr>
+                </table>
+              </td>`;
 
-  const html = `
-    <div style="font-family: Arial, sans-serif; color: #111; line-height: 1.5;">
-      <h2 style="margin-bottom: 4px;">Daily Call Digest</h2>
-      <p style="margin: 0;"><strong>${escapeHtml(business.name)}</strong></p>
-      <p style="margin-top: 4px;">Date: ${escapeHtml(label)} (${escapeHtml(timeZone)})</p>
-      <hr />
-      <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px;">
-        <div style="background: #f8f8f8; padding: 10px; border-radius: 8px;">
-          <div style="font-size: 12px; color: #666;">Total Calls</div>
-          <div style="font-size: 20px; font-weight: 700;">${stats.total}</div>
-        </div>
-        <div style="background: #f8f8f8; padding: 10px; border-radius: 8px;">
-          <div style="font-size: 12px; color: #666;">Missed Calls</div>
-          <div style="font-size: 20px; font-weight: 700;">${stats.missed}</div>
-        </div>
-        <div style="background: #f8f8f8; padding: 10px; border-radius: 8px;">
-          <div style="font-size: 12px; color: #666;">Top Intents</div>
-          <div style="font-size: 14px; font-weight: 600;">${escapeHtml(topIntents || 'None')}</div>
-        </div>
-      </div>
-      <h3 style="margin-bottom: 8px;">Key calls</h3>
-      <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
-        <thead>
-          <tr style="text-align: left; background: #fafafa;">
-            <th style="padding: 8px; border-bottom: 1px solid #eee;">Time</th>
-            <th style="padding: 8px; border-bottom: 1px solid #eee;">Caller</th>
-            <th style="padding: 8px; border-bottom: 1px solid #eee;">Status</th>
-            <th style="padding: 8px; border-bottom: 1px solid #eee;">Summary</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${tableRows}
-        </tbody>
+  const statusPill = (status) => {
+    const missed = ['no-answer', 'busy', 'failed'].includes(status);
+    const bg = missed ? '#F6E3DC' : '#EBF0EA';
+    const fg = missed ? '#B14A2C' : '#2E5A49';
+    return `<span style="display:inline-block;font-family:Arial,sans-serif;font-size:11px;font-weight:600;color:${fg};background:${bg};border-radius:20px;padding:3px 10px;white-space:nowrap;">${escapeHtml(status)}</span>`;
+  };
+
+  const callRowsHtml = keyCalls.length
+    ? keyCalls.map((c, i) => `
+              <tr><td style="padding:${i === 0 ? '0' : '10px'} 0 0;">
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff;border:1px solid #EBE2D2;border-radius:10px;">
+                  <tr><td style="padding:14px 16px;">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+                      <td style="font-family:Arial,sans-serif;font-size:13px;font-weight:600;color:#23201B;vertical-align:middle;">
+                        ${escapeHtml(c.from)}
+                        <span style="color:#B8AF9E;font-weight:400;">&middot; ${escapeHtml(c.time)}</span>
+                      </td>
+                      <td align="right" style="vertical-align:middle;">${statusPill(c.status)}</td>
+                    </tr></table>
+                    <div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.55;color:#5B564E;margin-top:8px;">${escapeHtml(c.summary)}</div>
+                  </td></tr>
+                </table>
+              </td></tr>`).join('')
+    : `
+              <tr><td style="padding:6px 0;font-family:Arial,sans-serif;font-size:14px;color:#8A8175;text-align:center;">No calls recorded for this period.</td></tr>`;
+
+  const dashboardBtnHtml = dashboardLink
+    ? `
+            <tr><td style="padding:22px 24px 0;">
+              <a href="${dashboardLink}" style="display:inline-block;background:#C2603F;color:#ffffff;text-decoration:none;font-family:Arial,sans-serif;font-size:14px;font-weight:600;padding:11px 22px;border-radius:8px;">Open dashboard &rarr;</a>
+            </td></tr>`
+    : '';
+
+  const html = `<!DOCTYPE html>
+<html>
+<body style="margin:0;padding:0;background:#FBF7F0;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#FBF7F0;padding:28px 12px;">
+    <tr><td align="center">
+      <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
+        <tr><td style="padding:4px 8px 18px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+            <td style="vertical-align:middle;">
+              <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#C2603F;vertical-align:middle;"></span>
+              <span style="font-family:Georgia,'Times New Roman',serif;font-size:22px;font-weight:bold;color:#23201B;vertical-align:middle;margin-left:8px;">Svaraa</span>
+            </td>
+            <td align="right" style="font-family:Arial,sans-serif;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#8A8175;vertical-align:middle;">Daily digest</td>
+          </tr></table>
+        </td></tr>
+        <tr><td style="background:#ffffff;border:1px solid #EBE2D2;border-radius:14px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+            <tr><td style="padding:24px 24px 4px;">
+              <div style="font-family:Georgia,'Times New Roman',serif;font-size:20px;font-weight:bold;color:#23201B;">${escapeHtml(business.name)}</div>
+              <div style="font-family:Arial,sans-serif;font-size:13px;color:#8A8175;margin-top:2px;">Your call summary for ${escapeHtml(label)}.</div>
+            </td></tr>
+            <tr><td style="padding:16px 18px 4px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+                ${statTile('Total calls', String(stats.total))}
+                ${statTile('Missed calls', String(stats.missed))}
+                ${statTile('Top intent', escapeHtml(topIntents ? topIntents.split(', ')[0] : 'None'), '15px')}
+              </tr></table>
+            </td></tr>
+            <tr><td style="padding:16px 24px 0;">
+              <div style="font-family:Arial,sans-serif;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#8A8175;margin-bottom:4px;">Key calls</div>
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+                ${callRowsHtml}
+              </table>
+            </td></tr>
+            ${dashboardBtnHtml}
+            <tr><td style="padding:22px 24px;"></td></tr>
+          </table>
+        </td></tr>
+        <tr><td style="padding:16px 8px;font-family:Arial,sans-serif;font-size:12px;color:#A79D8C;">
+          Svaraa &middot; AI phone answering for local business &middot; ${escapeHtml(timeZone)}
+        </td></tr>
       </table>
-      ${dashboardLink ? `<p style="margin-top: 16px;"><a href="${dashboardLink}">Open dashboard</a></p>` : ''}
-    </div>
-  `;
+    </td></tr>
+  </table>
+</body>
+</html>`;
 
   return { to: recipient, subject, html, text };
+}
+
+/**
+ * Format a phone number for display: +15135921240 → (513) 592-1240.
+ * Falls back to the raw value for non-US / unparseable numbers.
+ */
+function formatDigestPhone(raw) {
+  if (!raw) return 'Unknown caller';
+  const digits = String(raw).replace(/\D/g, '');
+  const ten = digits.length === 11 && digits.startsWith('1') ? digits.slice(1) : digits;
+  if (ten.length === 10) return `(${ten.slice(0, 3)}) ${ten.slice(3, 6)}-${ten.slice(6)}`;
+  return String(raw);
 }
 
 function shouldSendDigestNow(business, timeZone) {
